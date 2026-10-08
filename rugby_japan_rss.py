@@ -62,7 +62,6 @@ def get_old_items():
 def clean_title(text):
     text = " ".join(text.split())
 
-    # 日付以降を削除
     m = DATE_PATTERN.search(text)
 
     if m:
@@ -70,6 +69,22 @@ def clean_title(text):
 
     return text
 
+
+def parse_date(value):
+    try:
+        return parsedate_to_datetime(value)
+    except Exception:
+        return datetime(
+            1970,
+            1,
+            1,
+            tzinfo=timezone.utc
+        )
+
+
+# -------------------------
+# 公式サイト取得
+# -------------------------
 
 response = requests.get(
     URL,
@@ -97,7 +112,6 @@ for a in soup.find_all("a", href=True):
     href = a.get("href", "")
     article_url = urljoin(URL, href)
 
-    # 個別ニュース記事だけ
     if not re.fullmatch(
         r"https://www\.rugby-japan\.jp/news/\d+/?",
         article_url
@@ -108,10 +122,12 @@ for a in soup.find_all("a", href=True):
         continue
 
     # -------------------------
-    # タイトル取得
+    # タイトル
     # -------------------------
 
-    title = " ".join(a.stripped_strings).strip()
+    title = " ".join(
+        a.stripped_strings
+    ).strip()
 
     if not title:
         continue
@@ -122,7 +138,7 @@ for a in soup.find_all("a", href=True):
         continue
 
     # -------------------------
-    # 記事カード周辺から日付取得
+    # 日付
     # -------------------------
 
     parent = a
@@ -185,58 +201,126 @@ for a in soup.find_all("a", href=True):
     })
 
 
-items.sort(
-    key=lambda x: x["sort_date"],
-    reverse=True
-)
+# -------------------------
+# 公式サイト掲載順を保持
+# -------------------------
+
+# items は公式サイト上の掲載順。
+# 同じ日付の記事については、この順番を優先する。
+
+current_guids = {
+    item["guid"]
+    for item in items
+}
+
 
 # -------------------------
-# 既存RSSを保持
+# 既存RSS
 # -------------------------
 
 old_items = get_old_items()
-all_items = dict(old_items)
+
+
+# -------------------------
+# RSS掲載記事を作る
+# -------------------------
+
+final_items = []
+
+# まず今回公式サイトから取得した記事を
+# 公式サイトの掲載順そのままで追加
 
 for item in items:
 
-    all_items[
-        item["guid"]
-    ] = {
-        "title":
-            item["title"],
-        "link":
-            item["link"],
-        "description":
-            item["description"],
-        "pubDate":
-            item["pubDate"],
-    }
+    final_items.append({
+        "guid": item["guid"],
+        "title": item["title"],
+        "link": item["link"],
+        "description": item["description"],
+        "pubDate": item["pubDate"],
+        "sort_date": item["sort_date"],
+        "current": True,
+    })
 
 
-def parse_date(value):
+# 今回の一覧ページにない過去記事を追加
 
-    try:
-        return parsedate_to_datetime(
-            value
-        )
+for guid, data in old_items.items():
 
-    except Exception:
-        return datetime(
-            1970,
-            1,
-            1,
-            tzinfo=timezone.utc
-        )
+    if guid in current_guids:
+        continue
 
-
-sorted_items = sorted(
-    all_items.items(),
-    key=lambda x:
-        parse_date(
-            x[1]["pubDate"]
+    final_items.append({
+        "guid": guid,
+        "title": data["title"],
+        "link": data["link"],
+        "description": data["description"],
+        "pubDate": data["pubDate"],
+        "sort_date": parse_date(
+            data["pubDate"]
         ),
+        "current": False,
+    })
+
+
+# -------------------------
+# 並び替え
+# -------------------------
+
+# 日付単位で降順。
+# 同じ日付なら
+# 「今回公式サイトから取得した掲載順」を維持。
+
+date_groups = {}
+
+for item in final_items:
+
+    dt = item["sort_date"]
+
+    date_key = (
+        dt.year,
+        dt.month,
+        dt.day
+    )
+
+    if date_key not in date_groups:
+        date_groups[date_key] = []
+
+    date_groups[date_key].append(item)
+
+
+sorted_dates = sorted(
+    date_groups.keys(),
     reverse=True
-)[:300]
+)
+
+sorted_items = []
+
+for date_key in sorted_dates:
+
+    group = date_groups[date_key]
+
+    current_group = [
+        x for x in group
+        if x["current"]
+    ]
+
+    old_group = [
+        x for x in group
+        if not x["current"]
+    ]
+
+    sorted_items.extend(
+        current_group
+    )
+
+    sorted_items.extend(
+        old_group
+    )
+
+
+sorted_items = sorted_items[:300]
+
 
 # -------------------------
 # RSS生成
@@ -277,7 +361,8 @@ ET.SubElement(
     "language"
 ).text = "ja"
 
-for guid, data in sorted_items:
+
+for data in sorted_items:
 
     item = ET.SubElement(
         channel,
@@ -310,7 +395,7 @@ for guid, data in sorted_items:
         isPermaLink="false"
     )
 
-    guid_el.text = guid
+    guid_el.text = data["guid"]
 
 
 tree = ET.ElementTree(rss)
@@ -326,17 +411,20 @@ tree.write(
     xml_declaration=True
 )
 
+
 # -------------------------
 # 結果表示
 # -------------------------
 
 print()
 print("RSS作成成功")
+
 print(
     "今回取得:",
     len(items),
     "件"
 )
+
 print(
     "RSS保存件数:",
     len(sorted_items),
@@ -344,10 +432,10 @@ print(
 )
 
 print()
-print("取得記事:")
+print("RSS先頭記事:")
 
 for i, item in enumerate(
-    items,
+    sorted_items[:10],
     1
 ):
 
@@ -355,10 +443,12 @@ for i, item in enumerate(
     print(
         f"[{i}] {item['title']}"
     )
+
     print(
         "    ",
         item["pubDate"]
     )
+
     print(
         "    ",
         item["link"]
